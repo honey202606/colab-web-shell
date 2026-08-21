@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
 # ============================================================
-# Colab 一键 Web Shell + 云盘挂载（自包含，无第二阶段远程拉取）
+# Colab 一键 Web Shell + MEGA 上传（自包含，无第二阶段远程拉取）
 # 隧道：cloudflared（主） + ngrok（备，可选）
-# 云盘：MEGA 自动挂载（凭证后填，不写死在脚本）
+# 云盘：MEGA push（Colab 是远端环境，不能 FUSE 挂载你本地）
+#       产出文件通过 megaput 上传到 MEGA，你本地 /mnt/clouddisk-mega-honey 自动可见
 #
 # 使用（在 Colab Cell 里）：
 #   PORT=7681 PASSWORD=*** NGROK_TOKEN=*** \
 #   MEGA_EMAIL=*** MEGA_PASSWORD=*** \
 #   bash <(curl -fsSL <你的raw URL>/colab-web-shell.sh)
+#
+# 上传文件示例：
+#   mega-put --username=$MEGA_EMAIL --password=$MEGA_PASSWORD \
+#            --no-ask-password -f /content/output.png /Root/
 #
 # ⚠️ 所有敏感信息通过环境变量传入，脚本本身不含任何凭证，
 #    可安全 push 到 GitHub 公开仓库。
@@ -19,10 +24,9 @@ PORT=${PORT:-7681}
 PASSWORD=${PASSWORD:-$(openssl rand -hex 6)}
 NGROK_TOKEN=${NGROK_TOKEN:-}
 
-# MEGA 挂载（可选，留空则不挂载）
+# MEGA push 配置（可选，留空则不初始化）
 MEGA_EMAIL=${MEGA_EMAIL:-}
 MEGA_PASSWORD=${MEGA_PASSWORD:-}
-MOUNT_DIR=${MOUNT_DIR:-/content/mega}
 
 echo "[1/4] installing ttyd + megatools..."
 if ! command -v ttyd >/dev/null 2>&1; then
@@ -46,21 +50,15 @@ if [ -n "${NGROK_TOKEN}" ]; then
   ngrok http ${PORT} >/tmp/ngrok.log 2>&1 &
 fi
 
-echo "[4/4] mounting MEGA (if credentials provided)..."
+echo "[4/4] MEGA push setup (if credentials provided)..."
 if [ -n "${MEGA_EMAIL}" ] && [ -n "${MEGA_PASSWORD}" ]; then
-  mkdir -p "${MOUNT_DIR}"
-  # megatools 通过环境变量读取凭证
-  export MEGA_USER="${MEGA_EMAIL}"
-  export MEGA_PASSWORD="${MEGA_PASSWORD}"
-  # 测试登录并列出根目录，验证挂载可用
-  if megals --no-ask-password >/dev/null 2>&1; then
-    echo "  MEGA mounted at ${MOUNT_DIR} (use 'megacopy' / 'megals' for sync)"
-    echo "  test: megals  # 列出云端文件"
-  else
-    echo "  ⚠️ MEGA 登录失败，请检查 MEGA_EMAIL / MEGA_PASSWORD"
-  fi
+  echo "  MEGA_EMAIL=${MEGA_EMAIL}"
+  echo "  上传示例："
+  echo "    megaput --username=${MEGA_EMAIL} --password=${MEGA_PASSWORD} \\"
+  echo "            --no-ask-password -f /content/your_file.png /Root/"
+  echo "  云端查看：你本地 /mnt/clouddisk-mega-honey （已 FUSE 挂载，20GB）"
 else
-  echo "  MEGA 未挂载（未提供凭证）。需要时设 MEGA_EMAIL/MEGA_PASSWORD 重跑"
+  echo "  MEGA 未配置（未提供 MEGA_EMAIL/MEGA_PASSWORD）"
 fi
 
 sleep 8
@@ -80,6 +78,6 @@ if [ -n "${NGROK_TOKEN}" ]; then
 fi
 echo ""
 echo "  Colab 原生兜底: output.serve_kernel_port(${PORT})"
-echo "  MEGA 挂载点: ${MOUNT_DIR} (凭证通过环境变量，脚本无硬编码)"
+echo "  MEGA 上传: megaput --username=\$MEGA_EMAIL --password=\$MEGA_PASSWORD -f <file> /Root/"
 echo "========================================="
 echo "⏳ 连接超时约 90 分钟（Colab 免费版限制）"
