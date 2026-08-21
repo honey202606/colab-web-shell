@@ -1,39 +1,35 @@
 #!/usr/bin/env bash
 # ============================================================
-# Colab SSH 双通道暴露（serveo + 反向隧道）
-# 功能：Colab 容器开 sshd + 两条独立外连通道
-#   通道1: serveo（标准 SSH，无需跳板机）
-#   通道2: 反向 SSH 隧道（需要 JUMBPHOST 环境变量）
-# 用法：
-#   仅 serveo：
-#     bash <(curl -fsSL <raw_url>/colab-ssh-setup.sh)
-#   同时开启反向隧道（需要跳板机）：
-#     JUMBPHOST=user@jumphost.example.com bash <(curl -fsSL <raw_url>/colab-ssh-setup.sh)
+# Colab SSH 四通道暴露（陛下指定优先级）
+# 优先级：
+#   ① serveo（标准 SSH，无需跳板机）
+#   ② localhost.run（标准 SSH，无需跳板机）
+#   ③ Cloudflare SSH（需 cloudflared 客户端）
+#   ④ sshx.io（浏览器终端兜底）
 # ============================================================
 set -euo pipefail
 
-# ---------- 配置 ----------
 SSH_PORT=22
 SSH_PASSWORD=${SSH_PASSWORD:-$(openssl rand -hex 8)}
 SSH_USER=${SSH_USER:-root}
-JUMBPHOST=${JUMBPHOST:-}
 SERVEO_PORT=2222
+LH_PORT=2223
 
 echo "========================================="
-echo "  Colab SSH 双通道启动"
+echo "  Colab SSH 四通道启动"
 echo "  用户: ${SSH_USER}"
 echo "  密码: ${SSH_PASSWORD}"
 echo "========================================="
 
 # ---------- 1. 安装 SSH ----------
-echo "[1/5] 安装 openssh-server..."
+echo "[1/6] 安装 openssh-server..."
 apt-get update -qq
 apt-get install -y -qq openssh-server >/dev/null 2>&1 || {
   echo "openssh-server 安装失败"
   exit 1
 }
 
-echo "[2/5] 配置 SSH..."
+echo "[2/6] 配置 SSH..."
 mkdir -p /var/run/sshd
 echo "${SSH_USER}:${SSH_PASSWORD}" | chpasswd
 sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config || true
@@ -41,63 +37,88 @@ sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd
 service ssh start 2>/dev/null || /usr/sbin/sshd || true
 
 # ---------- 2. 通道1: serveo ----------
-echo "[3/5] 通道1: serveo（标准 SSH）..."
+echo "[3/6] 通道1: serveo..."
 ssh -o StrictHostKeyChecking=no -R ${SERVEO_PORT}:localhost:${SSH_PORT} serveo.net >/tmp/serveo_ssh.log 2>&1 &
 SERVEO_PID=$!
 sleep 6
-SERVEO_URL=$(grep -oE 'ssh://[a-z0-9.-]+\.serveo\.net' /tmp/serveo_ssh.log | tail -1 || true)
-SERVEO_HOST=$(echo "${SERVEO_URL}" | sed -E 's|ssh://||; s|:.*||' || true)
-if [ -n "${SERVEO_HOST}" ]; then
-  echo "  [✓] serveo: ${SERVEO_HOST}:${SERVEO_PORT}"
-else
-  echo "  [!] serveo: 生成中或失败，查看 /tmp/serveo_ssh.log"
-fi
+SERVEO_HOST=$(grep -oE '[a-z0-9.-]+\.serveo\.net' /tmp/serveo_ssh.log | tail -1 || true)
 
-# ---------- 3. 通道2: 反向 SSH 隧道 ----------
-echo "[4/5] 通道2: 反向 SSH 隧道..."
-if [ -n "${JUMBPHOST}" ]; then
-  ssh -o StrictHostKeyChecking=no -R 2222:localhost:${SSH_PORT} ${JUMBPHOST} >/tmp/reverse_ssh.log 2>&1 &
-  REVERSE_PID=$!
-  sleep 4
-  echo "  [✓] 反向隧道已启动到 ${JUMBPHOST}"
-  echo "      在跳板机上执行: ssh -p 2222 ${SSH_USER}@localhost"
-else
-  echo "  [i] 未提供 JUMBPHOST，跳过反向隧道"
-  echo "      如需开启，执行: JUMBPHOST=user@host bash <(curl ...)"
-fi
+# ---------- 3. 通道2: localhost.run ----------
+echo "[4/6] 通道2: localhost.run..."
+ssh -o StrictHostKeyChecking=no -R ${LH_PORT}:localhost:${SSH_PORT} localhost.run >/tmp/lh_ssh.log 2>&1 &
+LH_PID=$!
+sleep 6
+LH_HOST=$(grep -oE '[a-z0-9.-]+\.localhost\.run' /tmp/lh_ssh.log | tail -1 || true)
 
-# ---------- 4. 输出连接信息 ----------
+# ---------- 4. 通道3: Cloudflare SSH ----------
+echo "[5/6] 通道3: Cloudflare SSH..."
+if ! command -v cloudflared >/dev/null 2>&1; then
+  curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
+  chmod +x /tmp/cloudflared
+fi
+/tmp/cloudflared tunnel --url ssh://localhost:${SSH_PORT} >/tmp/cf_ssh.log 2>&1 &
+CF_PID=$!
+sleep 8
+CF_HOST=$(grep -oE '[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_ssh.log | tail -1 || true)
+
+# ---------- 5. 通道4: sshx ----------
+echo "[6/6] 通道4: sshx (浏览器终端)..."
+if ! command -v sshx >/dev/null 2>&1; then
+  if [ -f /root/.cargo/bin/sshx ]; then
+    export PATH="/root/.cargo/bin:$PATH"
+  else
+    apt-get install -y -qq protobuf-compiler >/dev/null 2>&1 || true
+    PROTOC=/usr/bin/protoc cargo install sshx >/dev/null 2>&1 || true
+    export PATH="/root/.cargo/bin:$PATH"
+  fi
+fi
+sshx -q >/tmp/sshx.log 2>&1 &
+SSHX_PID=$!
+sleep 5
+SSHX_URL=$(grep -oE 'https://sshx\.io/s/[A-Za-z0-9]+#[A-Za-z0-9]+' /tmp/sshx.log | tail -1 || true)
+
+# ---------- 6. 输出连接信息 ----------
 echo ""
 echo "========================================="
-echo "  连接信息"
+echo "  连接信息（按优先级尝试）"
 echo "========================================="
 echo ""
-echo "【通道1】serveo（推荐）"
+echo "【① serveo】主用（标准 SSH）"
 if [ -n "${SERVEO_HOST}" ]; then
   echo "   ssh -p ${SERVEO_PORT} ${SSH_USER}@${SERVEO_HOST}"
-  echo "   密码: ${SSH_PASSWORD}"
 else
   echo "   ssh -p ${SERVEO_PORT} ${SSH_USER}@serveo.net"
-  echo "   密码: ${SSH_PASSWORD}"
-  echo "   （等待 URL 生成，或查看 /tmp/serveo_ssh.log）"
 fi
-echo ""
-echo "【通道2】反向隧道（需跳板机）"
-if [ -n "${JUMBPHOST}" ]; then
-  echo "   在跳板机 ${JUMBPHOST} 上："
-  echo "   ssh -p 2222 ${SSH_USER}@localhost"
-  echo "   密码: ${SSH_PASSWORD}"
-else
-  echo "   未配置 JUMBPHOST，跳过"
-fi
-echo ""
-echo "【本地直连测试】"
-echo "   ssh -p ${SSH_PORT} ${SSH_USER}@localhost"
 echo "   密码: ${SSH_PASSWORD}"
 echo ""
+echo "【② localhost.run】备用（标准 SSH）"
+if [ -n "${LH_HOST}" ]; then
+  echo "   ssh -p ${LH_PORT} ${SSH_USER}@${LH_HOST}"
+else
+  echo "   ssh -p ${LH_PORT} ${SSH_USER}@localhost.run"
+fi
+echo "   密码: ${SSH_PASSWORD}"
+echo ""
+echo "【③ Cloudflare SSH】备用（需 cloudflared 客户端）"
+if [ -n "${CF_HOST}" ]; then
+  echo "   ssh -o ProxyCommand='cloudflared access ssh --hostname ${CF_HOST}' ${SSH_USER}@${CF_HOST}"
+else
+  echo "   域名生成中，查看 /tmp/cf_ssh.log"
+fi
+echo "   密码: ${SSH_PASSWORD}"
+echo ""
+echo "【④ sshx.io】浏览器兜底"
+if [ -n "${SSHX_URL}" ]; then
+  echo "   ${SSHX_URL}"
+else
+  echo "   生成中，查看 /tmp/sshx.log"
+fi
+echo ""
 echo "========================================="
-echo "  sshd PID: $(cat /var/run/sshd.pid 2>/dev/null || echo 'unknown')"
 echo "  serveo PID: ${SERVEO_PID:-unknown}"
+echo "  localhost.run PID: ${LH_PID:-unknown}"
+echo "  cloudflared PID: ${CF_PID:-unknown}"
+echo "  sshx PID: ${SSHX_PID:-unknown}"
 echo "  后台运行中..."
 echo "========================================="
 
