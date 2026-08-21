@@ -12,8 +12,9 @@ set -euo pipefail
 SSH_PORT=22
 SSH_PASSWORD=${SSH_PASSWORD:-$(openssl rand -hex 8)}
 SSH_USER=${SSH_USER:-root}
-SERVEO_PORT=2222
-LH_PORT=2223
+# 随机端口避免冲突
+SERVEO_PORT=$((RANDOM % 9000 + 2000))
+LH_PORT=$((RANDOM % 9000 + 2000))
 
 echo "========================================="
 echo "  Colab SSH 四通道启动"
@@ -37,14 +38,14 @@ sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd
 service ssh start 2>/dev/null || /usr/sbin/sshd || true
 
 # ---------- 2. 通道1: serveo ----------
-echo "[3/6] 通道1: serveo..."
+echo "[3/6] 通道1: serveo (端口 ${SERVEO_PORT})..."
 ssh -o StrictHostKeyChecking=no -R ${SERVEO_PORT}:localhost:${SSH_PORT} serveo.net >/tmp/serveo_ssh.log 2>&1 &
 SERVEO_PID=$!
 sleep 6
 SERVEO_HOST=$(grep -oE '[a-z0-9.-]+\.serveo\.net' /tmp/serveo_ssh.log | tail -1 || true)
 
 # ---------- 3. 通道2: localhost.run ----------
-echo "[4/6] 通道2: localhost.run..."
+echo "[4/6] 通道2: localhost.run (端口 ${LH_PORT})..."
 ssh -o StrictHostKeyChecking=no -R ${LH_PORT}:localhost:${SSH_PORT} localhost.run >/tmp/lh_ssh.log 2>&1 &
 LH_PID=$!
 sleep 6
