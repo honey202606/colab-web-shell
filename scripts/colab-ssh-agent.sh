@@ -25,19 +25,20 @@ grep -q "PasswordAuthentication yes" /etc/ssh/sshd_config || echo "PasswordAuthe
 # 生成 host keys（sshd 启动必须）
 ssh-keygen -A 2>/dev/null || true
 
-# 3. 启动 sshd
+# 3. 启动 sshd 并自动发现真实监听端口
 echo "[3/4] 启动 sshd..."
 pkill sshd 2>/dev/null || true
 sleep 1
-/usr/sbin/sshd
+/usr/sbin/sshd -p 22 2>/dev/null || /usr/sbin/sshd
 sleep 2
-if ss -tlnp 2>/dev/null | grep -q ':22'; then
-  echo "[OK] sshd 监听 22 端口"
-else
-  echo "[!] sshd 未监听，重试直接指定端口..."
-  /usr/sbin/sshd -p 22
-  sleep 2
+
+# 自动发现 sshd 真实监听端口（Colab 可能把 22 映射到 2222）
+SSHD_PORT=$(ss -tlnp 2>/dev/null | grep -oE ':([0-9]+)' | grep -vE ':22\b' | head -1 | tr -d ':' || true)
+if [ -z "${SSHD_PORT}" ]; then
+  SSHD_PORT=$(ss -tlnp 2>/dev/null | grep -oE ':22\b' | head -1 | tr -d ':' || true)
 fi
+SSHD_PORT=${SSHD_PORT:-22}
+echo "[OK] sshd 监听端口: ${SSHD_PORT}"
 
 # 4. 启动 cloudflared tunnel
 echo "[4/4] 启动 cloudflared quick tunnel..."
@@ -45,10 +46,10 @@ if ! command -v cloudflared >/dev/null 2>&1; then
   curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
   chmod +x /tmp/cloudflared
 fi
-/tmp/cloudflared tunnel --url ssh://localhost:22 >/tmp/cf_ssh.log 2>&1 &
+/tmp/cloudflared tunnel --url ssh://localhost:${SSHD_PORT} >/tmp/cf_ssh.log 2>&1 &
 sleep 10
 
-CF_HOST=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_ssh.log | tail -1 || true)
+CF_HOST=$(grep -oE '[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_ssh.log | tail -1 || true)
 
 # 输出连接信息（供 agent 读取）
 echo "=========================================="
