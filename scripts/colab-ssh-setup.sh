@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 # ============================================================
-# Colab SSH 四通道暴露（陛下指定优先级）
+# Colab SSH 四通道暴露（自定义 sshd 端口版）
+# 关键修正：sshd 跑在随机高端口（非 22，避开容器限制）
 # 优先级：
-#   ① serveo（标准 SSH，无需跳板机）
-#   ② localhost.run（标准 SSH，无需跳板机）
+#   ① serveo（标准 SSH）
+#   ② localhost.run（标准 SSH）
 #   ③ Cloudflare SSH（需 cloudflared 客户端）
 #   ④ sshx.io（浏览器终端兜底）
 # ============================================================
 set -euo pipefail
 
-SSH_PORT=22
+# sshd 自定义端口（随机高端口）
+SSHD_PORT=$((RANDOM % 40000 + 20000))
 SSH_PASSWORD=${SSH_PASSWORD:-$(openssl rand -hex 8)}
 SSH_USER=${SSH_USER:-root}
-# 随机端口避免冲突
 SERVEO_PORT=$((RANDOM % 9000 + 2000))
 LH_PORT=$((RANDOM % 9000 + 2000))
 
 echo "========================================="
 echo "  Colab SSH 四通道启动"
+echo "  sshd 端口: ${SSHD_PORT}"
 echo "  用户: ${SSH_USER}"
 echo "  密码: ${SSH_PASSWORD}"
 echo "========================================="
@@ -30,39 +32,50 @@ apt-get install -y -qq openssh-server >/dev/null 2>&1 || {
   exit 1
 }
 
-echo "[2/6] 配置 SSH..."
+# ---------- 2. 配置 SSH（自定义端口）----------
+echo "[2/6] 配置 SSH (端口 ${SSHD_PORT})..."
 mkdir -p /var/run/sshd
 echo "${SSH_USER}:${SSH_PASSWORD}" | chpasswd
-sed -i 's/#PermitRootLogin prohibit-password/PermitRootLogin yes/' /etc/ssh/sshd_config || true
-sed -i 's/#PasswordAuthentication yes/PasswordAuthentication yes/' /etc/ssh/sshd_config || true
-service ssh start 2>/dev/null || /usr/sbin/sshd || true
+# 写自定义端口配置
+cat > /etc/ssh/sshd_config.d/colab-ssh.conf << EOF
+Port ${SSHD_PORT}
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication no
+EOF
+# 主配置里如果有 Port 22 也注释掉，避免冲突
+sed -i 's/^#\?Port 22/Port 22/' /etc/ssh/sshd_config || true
+service ssh restart 2>/dev/null || /usr/sbin/sshd || true
+sleep 2
+# 确认端口在监听
+echo "  监听检查: $(ss -tlnp 2>/dev/null | grep ":${SSHD_PORT}" || echo '未监听，重试')"
 
-# ---------- 2. 通道1: serveo ----------
-echo "[3/6] 通道1: serveo (端口 ${SERVEO_PORT})..."
-ssh -o StrictHostKeyChecking=no -R ${SERVEO_PORT}:localhost:${SSH_PORT} serveo.net >/tmp/serveo_ssh.log 2>&1 &
+# ---------- 3. 通道1: serveo ----------
+echo "[3/6] 通道1: serveo (远程端口 ${SERVEO_PORT} → 本地 ${SSHD_PORT})..."
+ssh -o StrictHostKeyChecking=no -R ${SERVEO_PORT}:localhost:${SSHD_PORT} serveo.net >/tmp/serveo_ssh.log 2>&1 &
 SERVEO_PID=$!
 sleep 6
 SERVEO_HOST=$(grep -oE '[a-z0-9.-]+\.serveo\.net' /tmp/serveo_ssh.log | tail -1 || true)
 
-# ---------- 3. 通道2: localhost.run ----------
-echo "[4/6] 通道2: localhost.run (端口 ${LH_PORT})..."
-ssh -o StrictHostKeyChecking=no -R ${LH_PORT}:localhost:${SSH_PORT} localhost.run >/tmp/lh_ssh.log 2>&1 &
+# ---------- 4. 通道2: localhost.run ----------
+echo "[4/6] 通道2: localhost.run (远程端口 ${LH_PORT} → 本地 ${SSHD_PORT})..."
+ssh -o StrictHostKeyChecking=no -R ${LH_PORT}:localhost:${SSHD_PORT} localhost.run >/tmp/lh_ssh.log 2>&1 &
 LH_PID=$!
 sleep 6
 LH_HOST=$(grep -oE '[a-z0-9.-]+\.localhost\.run' /tmp/lh_ssh.log | tail -1 || true)
 
-# ---------- 4. 通道3: Cloudflare SSH ----------
-echo "[5/6] 通道3: Cloudflare SSH..."
+# ---------- 5. 通道3: Cloudflare SSH ----------
+echo "[5/6] 通道3: Cloudflare SSH (本地 ${SSHD_PORT})..."
 if ! command -v cloudflared >/dev/null 2>&1; then
   curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o /tmp/cloudflared
   chmod +x /tmp/cloudflared
 fi
-/tmp/cloudflared tunnel --url ssh://localhost:${SSH_PORT} >/tmp/cf_ssh.log 2>&1 &
+/tmp/cloudflared tunnel --url ssh://localhost:${SSHD_PORT} >/tmp/cf_ssh.log 2>&1 &
 CF_PID=$!
 sleep 8
 CF_HOST=$(grep -oE '[a-z0-9-]+\.trycloudflare\.com' /tmp/cf_ssh.log | tail -1 || true)
 
-# ---------- 5. 通道4: sshx ----------
+# ---------- 6. 通道4: sshx ----------
 echo "[6/6] 通道4: sshx (浏览器终端)..."
 if ! command -v sshx >/dev/null 2>&1; then
   if [ -f /root/.cargo/bin/sshx ]; then
@@ -78,7 +91,7 @@ SSHX_PID=$!
 sleep 5
 SSHX_URL=$(grep -oE 'https://sshx\.io/s/[A-Za-z0-9]+#[A-Za-z0-9]+' /tmp/sshx.log | tail -1 || true)
 
-# ---------- 6. 输出连接信息 ----------
+# ---------- 7. 输出连接信息 ----------
 echo ""
 echo "========================================="
 echo "  连接信息（按优先级尝试）"
@@ -116,6 +129,7 @@ else
 fi
 echo ""
 echo "========================================="
+echo "  sshd 端口: ${SSHD_PORT}"
 echo "  serveo PID: ${SERVEO_PID:-unknown}"
 echo "  localhost.run PID: ${LH_PID:-unknown}"
 echo "  cloudflared PID: ${CF_PID:-unknown}"
